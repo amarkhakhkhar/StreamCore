@@ -1,20 +1,79 @@
 version: '3.8'
 
 services:
-  broker:
+  broker-1:
     build:
-      context: ..
+      context: .
       dockerfile: docker/Dockerfile
-    container_name: streamcore-broker
+    container_name: streamcore-broker-1
+    hostname: broker-1
     ports:
-      - "8000:8000"
+      - "8001:8000"
     volumes:
-      # Mountable volume for segment durability
-      - streamcore-data:/data/logs
+      - broker-1-data:/data/logs
     environment:
       - STREAMCORE_LOG_DIR=/data/logs
-      - STREAMCORE_SEGMENT_SIZE=1048576  # 1MB segments for testing
+      - STREAMCORE_SEGMENT_SIZE=1048576
+      - STREAMCORE_SEGMENT_MAX_AGE_MS=0
       - STREAMCORE_PORT=8000
+      - BROKER_ID=1
+      - CLUSTER_PEERS=broker-2:8000,broker-3:8000
+    networks:
+      - streamcore-cluster
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/health').raise_for_status()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+
+  broker-2:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: streamcore-broker-2
+    hostname: broker-2
+    ports:
+      - "8002:8000"
+    volumes:
+      - broker-2-data:/data/logs
+    environment:
+      - STREAMCORE_LOG_DIR=/data/logs
+      - STREAMCORE_SEGMENT_SIZE=1048576
+      - STREAMCORE_SEGMENT_MAX_AGE_MS=0
+      - STREAMCORE_PORT=8000
+      - BROKER_ID=2
+      - CLUSTER_PEERS=broker-1:8000,broker-3:8000
+    networks:
+      - streamcore-cluster
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/health').raise_for_status()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+
+  broker-3:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: streamcore-broker-3
+    hostname: broker-3
+    ports:
+      - "8003:8000"
+    volumes:
+      - broker-3-data:/data/logs
+    environment:
+      - STREAMCORE_LOG_DIR=/data/logs
+      - STREAMCORE_SEGMENT_SIZE=1048576
+      - STREAMCORE_SEGMENT_MAX_AGE_MS=0
+      - STREAMCORE_PORT=8000
+      - BROKER_ID=3
+      - CLUSTER_PEERS=broker-1:8000,broker-2:8000
+    networks:
+      - streamcore-cluster
     healthcheck:
       test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/health').raise_for_status()"]
       interval: 30s
@@ -24,5 +83,13 @@ services:
     restart: unless-stopped
 
 volumes:
-  streamcore-data:
+  broker-1-data:
     driver: local
+  broker-2-data:
+    driver: local
+  broker-3-data:
+    driver: local
+
+networks:
+  streamcore-cluster:
+    driver: bridge

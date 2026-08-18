@@ -1,19 +1,14 @@
 # Stage 1: Build stage
-FROM python:3.11-slim as builder
+FROM python:3.11-slim AS builder
 
 WORKDIR /build
 
-# Install build dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc \
-    && rm -rf /var/lib/apt/lists/*
-
 # Copy requirements and install dependencies
 COPY requirements.txt .
-RUN pip wheel --no-cache-dir --no-deps --wheel-dir /build/wheels -r requirements.txt
+RUN pip wheel --no-cache-dir --wheel-dir /build/wheels -r requirements.txt
 
 # Stage 2: Runtime stage
-FROM python:3.11-slim as runtime
+FROM python:3.11-slim AS runtime
 
 # Create non-root user for security
 RUN groupadd -r streamcore && useradd -r -g streamcore streamcore

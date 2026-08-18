@@ -33,12 +33,14 @@ async def lifespan(app: FastAPI):
     global _log
 
     log_dir = Path(os.getenv("STREAMCORE_LOG_DIR", "/data/logs"))
-    segment_size = int(os.getenv("STREAMCORE_SEGMENT_SIZE", 1024 * 1024))  # 1MB default for testing
+    segment_size = int(os.getenv("STREAMCORE_SEGMENT_SIZE", 1024 * 1024))  # 1MB default
+    segment_max_age_ms = int(os.getenv("STREAMCORE_SEGMENT_MAX_AGE_MS", "0"))  # 0 = disabled
 
     _log = PartitionLog(
         name="default",
         log_dir=log_dir,
-        segment_max_size=segment_size
+        segment_max_size=segment_size,
+        segment_max_age_ms=segment_max_age_ms
     )
 
     yield
@@ -82,6 +84,15 @@ class SegmentInfo(BaseModel):
     sealed: bool
 
 
+class RotationInfo(BaseModel):
+    """Information about segment rotation."""
+    rotation_count: int
+    last_rotation_reason: str
+    segment_max_size: int
+    segment_max_age_ms: int
+    active_segment_age_ms: int
+
+
 class LogInfoResponse(BaseModel):
     """Information about the partition log."""
     name: str
@@ -90,7 +101,41 @@ class LogInfoResponse(BaseModel):
     segment_count: int
     sealed_segment_count: int
     segments: list[SegmentInfo]
+    rotation: RotationInfo
 
+
+class ConsumerLagResponse(BaseModel):
+    """Consumer lag information."""
+    consumer_id: str
+    committed_offset: int
+    high_watermark: int
+    lag: int
+    last_heartbeat_ms: int
+
+
+class AllLagResponse(BaseModel):
+    """Lag for all consumers."""
+    consumers: dict
+
+
+class CommitRequest(BaseModel):
+    """Request to commit consumer offset."""
+    consumer_id: str
+    offset: int
+
+
+class RegisterConsumerRequest(BaseModel):
+    """Request to register a consumer."""
+    consumer_id: str
+
+
+class LaggingConsumersResponse(BaseModel):
+    """List of lagging consumers."""
+    threshold: int
+    lagging_consumers: list[str]
+
+
+# ==================== Log Operations ====================
 
 @app.post("/append", response_model=AppendResponse)
 async def append_record(request: AppendRequest):
@@ -136,6 +181,7 @@ async def read_records(start_offset: int = 0, max_records: int = 100):
 async def get_info():
     """Get partition log information."""
     log = get_log()
+    rotation_info = log.get_rotation_info()
 
     return LogInfoResponse(
         name=log.name,
@@ -145,9 +191,71 @@ async def get_info():
         sealed_segment_count=log.sealed_segment_count,
         segments=[
             SegmentInfo(**s) for s in log.get_segments_info()
-        ]
+        ],
+        rotation=RotationInfo(**rotation_info)
     )
 
+
+# ==================== Consumer Lag Operations ====================
+
+@app.post("/consumer/register")
+async def register_consumer(request: RegisterConsumerRequest):
+    """Register a consumer for lag tracking."""
+    log = get_log()
+    log.register_consumer(request.consumer_id)
+    return {"status": "registered", "consumer_id": request.consumer_id}
+
+
+@app.post("/consumer/commit")
+async def commit_offset(request: CommitRequest):
+    """Commit consumer offset (consumer confirms it processed up to this offset)."""
+    log = get_log()
+    log.commit(request.consumer_id, request.offset)
+    return {
+        "status": "committed",
+        "consumer_id": request.consumer_id,
+        "committed_offset": request.offset
+    }
+
+
+@app.get("/consumer/{consumer_id}/lag", response_model=ConsumerLagResponse)
+async def get_consumer_lag(consumer_id: str):
+    """Get lag for a specific consumer."""
+    log = get_log()
+    all_lag = log.get_all_consumer_lag()
+
+    if consumer_id not in all_lag:
+        raise HTTPException(status_code=404, detail=f"Consumer '{consumer_id}' not registered")
+
+    lag_info = all_lag[consumer_id]
+    return ConsumerLagResponse(
+        consumer_id=consumer_id,
+        committed_offset=lag_info["committed_offset"],
+        high_watermark=lag_info["high_watermark"],
+        lag=lag_info["lag"],
+        last_heartbeat_ms=lag_info["last_heartbeat_ms"]
+    )
+
+
+@app.get("/consumer/lag", response_model=AllLagResponse)
+async def get_all_lag():
+    """Get lag for all tracked consumers."""
+    log = get_log()
+    return AllLagResponse(consumers=log.get_all_consumer_lag())
+
+
+@app.get("/consumer/lagging", response_model=LaggingConsumersResponse)
+async def get_lagging_consumers(threshold: int = 100):
+    """Get list of consumers lagging beyond threshold."""
+    log = get_log()
+    lagging = log.get_lagging_consumers(threshold)
+    return LaggingConsumersResponse(
+        threshold=threshold,
+        lagging_consumers=lagging
+    )
+
+
+# ==================== Health ====================
 
 @app.get("/health")
 async def health_check():

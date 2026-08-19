@@ -1,0 +1,164 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: streamcore-broker-config
+  namespace: streamcore
+data:
+  STREAMCORE_LOG_DIR: "/data/logs"
+  STREAMCORE_SEGMENT_SIZE: "1048576"
+  STREAMCORE_SEGMENT_MAX_AGE_MS: "300000"
+  STREAMCORE_BP_WINDOW_MS: "1000"
+  STREAMCORE_BP_TRIGGER_WINDOWS: "3"
+  STREAMCORE_BP_LATENCY_THRESHOLD_MS: "50.0"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: streamcore-broker-headless
+  namespace: streamcore
+  labels:
+    app: streamcore-broker
+spec:
+  clusterIP: None
+  selector:
+    app: streamcore-broker
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+    - name: gossip
+      port: 8001
+      targetPort: 8001
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: streamcore-broker-service
+  namespace: streamcore
+  labels:
+    app: streamcore-broker
+spec:
+  selector:
+    app: streamcore-broker
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: streamcore-broker
+  namespace: streamcore
+  labels:
+    app: streamcore-broker
+spec:
+  serviceName: streamcore-broker-headless
+  replicas: 3
+  selector:
+    matchLabels:
+      app: streamcore-broker
+  template:
+    metadata:
+      labels:
+        app: streamcore-broker
+    spec:
+      containers:
+        - name: broker
+          image: ghcr.io/your-org/streamcore-broker:latest
+          ports:
+            - containerPort: 8000
+              name: http
+            - containerPort: 8001
+              name: gossip
+          envFrom:
+            - configMapRef:
+                name: streamcore-broker-config
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "250m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      volumes:
+        - name: config
+          configMap:
+            name: streamcore-broker-config
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: streamcore-producer
+  namespace: streamcore
+  labels:
+    app: streamcore-producer
+spec:
+  containers:
+    - name: producer
+      image: ghcr.io/your-org/streamcore-broker:latest
+      command: ["python", "-c", "import time; import requests; [requests.post('http://streamcore-broker-service:8000/append', json={'data': f'msg-{i}'}) or time.sleep(0.1) for i in range(100)]"]
+      resources:
+        requests:
+          memory: "64Mi"
+          cpu: "50m"
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: streamcore-consumer-group-a
+  namespace: streamcore
+  labels:
+    app: streamcore-consumer
+    group: fast
+spec:
+  containers:
+    - name: consumer-a
+      image: ghcr.io/your-org/streamcore-broker:latest
+      command: ["python", "-c", "import time; import requests; requests.post('http://streamcore-broker-service:8000/consumer-groups', json={'group_id': 'fast-consumer'}); [requests.post('http://streamcore-broker-service:8000/consumer-groups/fast-consumer/read', json={'partition': 'orders', 'max_records': 10}) or time.sleep(0.5) for _ in range(20)]"]
+      resources:
+        requests:
+          memory: "64Mi"
+          cpu: "50m"
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: streamcore-consumer-group-b
+  namespace: streamcore
+  labels:
+    app: streamcore-consumer
+    group: slow
+spec:
+  containers:
+    - name: consumer-b
+      image: ghcr.io/your-org/streamcore-broker:latest
+      command: ["python", "-c", "import time; import requests; requests.post('http://streamcore-broker-service:8000/consumer-groups', json={'group_id': 'slow-consumer'}); [requests.post('http://streamcore-broker-service:8000/consumer-groups/slow-consumer/read', json={'partition': 'orders', 'max_records': 1}) or time.sleep(2.5) for _ in range(4)]"]
+      resources:
+        requests:
+          memory: "64Mi"
+          cpu: "50m"

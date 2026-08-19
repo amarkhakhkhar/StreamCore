@@ -1,10 +1,8 @@
-The Daily Temperatures problem keeps showing up in production.
+I used to think the Daily Temperatures problem was just interview homework.
 
-LeetCode 739: "Given an array of temperatures, return how many days until a warmer day."
+LeetCode 739: given an array of daily temperatures, return how many days you wait for a warmer one. The optimal solution? A monotonic decreasing stack. You push indices. When a warmer day arrives, you pop everything cooler and calculate the span — consecutive days below current.
 
-The optimal solution uses a monotonic decreasing stack. You push indices. When a warmer day arrives, you pop everything cooler and calculate the span — that span is exactly "consecutive days below current."
-
-Same pattern. Different stakes.
+That span calculation is 40 lines of code.
 
 ---
 
@@ -26,6 +24,6 @@ python scripts/load_test_backpressure.py --burst-rate 2000
 python scripts/check_backpressure_alert.py --inject-latency 200 --wait-bp
 ```
 
-Watch the broker absorb the burst, activate backpressure at ~12s, and stabilize. The stack span calculation is ~40 lines. The alternative is a crashed broker and a 3am page.
+Watch the broker absorb the burst, activate backpressure at ~12s, and stabilize. The alternative is a crashed broker and a 3am page.
 
 #StreamCore #Backpressure #MonotonicStack #DailyTemperatures #SystemsEngineering #Day15of60

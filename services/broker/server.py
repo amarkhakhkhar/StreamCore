@@ -17,6 +17,7 @@ from pydantic import BaseModel
 from .partition_log import PartitionLog
 from .routing import RoutingEngine, create_routing_engine
 from .backpressure import BackpressureMiddleware, create_backpressure_middleware
+from .consumer_group import ConsumerGroupManager, create_consumer_group_manager
 
 
 # Global partition log instance
@@ -24,6 +25,9 @@ _log: Optional[PartitionLog] = None
 
 # Global backpressure middleware
 _backpressure: Optional[BackpressureMiddleware] = None
+
+# Global consumer group manager
+_consumer_group_manager: Optional[ConsumerGroupManager] = None
 
 
 def get_log() -> PartitionLog:
@@ -56,11 +60,15 @@ async def lifespan(app: FastAPI):
         latency_threshold_ms=float(os.getenv("STREAMCORE_BP_LATENCY_THRESHOLD_MS", "50.0")),
     )
 
+    global _consumer_group_manager
+    _consumer_group_manager = create_consumer_group_manager()
+
     yield
 
     _log.close()
     _log = None
     _backpressure = None
+    _consumer_group_manager = None
 
 
 app = FastAPI(
@@ -232,6 +240,10 @@ async def append_record(request: AppendRequest):
     # Record latency for backpressure tracking
     if _backpressure:
         _backpressure.record_append_latency(latency_ms)
+
+    # Also append to consumer group manager's circular buffer
+    if _consumer_group_manager:
+        _consumer_group_manager.append_to_partition("default", request.data.encode())
 
     return AppendResponse(offset=offset)
 
@@ -472,6 +484,167 @@ async def inject_test_latency(latency_ms: float):
         "backpressure_active": _backpressure.should_throttle(),
         "stats": _backpressure.get_stats()
     }
+
+
+# ==================== Consumer Group Models ====================
+
+class ConsumerGroupCreateRequest(BaseModel):
+    """Request to create a consumer group."""
+    group_id: str
+
+
+class ConsumerGroupMemberRequest(BaseModel):
+    """Request to register a member to a consumer group."""
+    member_id: str
+    partitions: list[str] = []
+
+
+class ConsumerGroupReadRequest(BaseModel):
+    """Request to read records for a consumer group."""
+    partition: str
+    max_records: int = 100
+
+
+class ConsumerGroupResponse(BaseModel):
+    """Response with consumer group information."""
+    group_id: str
+    members: list[str]
+    offsets: dict[str, int]
+
+
+class ConsumerGroupListResponse(BaseModel):
+    """List of all consumer groups."""
+    groups: list[str]
+
+
+class ConsumerGroupReadResponse(BaseModel):
+    """Records read for a consumer group."""
+    records: list[RecordResponse]
+    next_offset: int
+
+
+class ConsumerGroupLagResponse(BaseModel):
+    """Lag information for a consumer group."""
+    partition: str
+    high_watermark: int
+    group_offsets: dict[str, int]
+
+
+# ==================== Consumer Group Operations ====================
+
+def get_consumer_group_manager() -> ConsumerGroupManager:
+    """Get the global consumer group manager instance."""
+    if _consumer_group_manager is None:
+        raise RuntimeError("Consumer group manager not initialized")
+    return _consumer_group_manager
+
+
+@app.post("/consumer-groups", response_model=ConsumerGroupResponse)
+async def create_consumer_group(request: ConsumerGroupCreateRequest):
+    """Create a new consumer group."""
+    manager = get_consumer_group_manager()
+    group = manager.create_group(request.group_id)
+    return ConsumerGroupResponse(
+        group_id=group.group_id,
+        members=list(group.members.keys()),
+        offsets=group.partition_offsets
+    )
+
+
+@app.get("/consumer-groups", response_model=ConsumerGroupListResponse)
+async def list_consumer_groups():
+    """List all consumer groups."""
+    manager = get_consumer_group_manager()
+    return ConsumerGroupListResponse(groups=manager.list_groups())
+
+
+@app.get("/consumer-groups/{group_id}", response_model=ConsumerGroupResponse)
+async def get_consumer_group(group_id: str):
+    """Get a consumer group's information."""
+    manager = get_consumer_group_manager()
+    group = manager.get_group(group_id)
+    if not group:
+        raise HTTPException(status_code=404, detail=f"Consumer group '{group_id}' not found")
+    return ConsumerGroupResponse(
+        group_id=group.group_id,
+        members=list(group.members.keys()),
+        offsets=group.partition_offsets
+    )
+
+
+@app.post("/consumer-groups/{group_id}/members", response_model=ConsumerGroupMemberRequest)
+async def register_member(group_id: str, request: ConsumerGroupMemberRequest):
+    """Register a member to a consumer group."""
+    manager = get_consumer_group_manager()
+    member = manager.register_member(group_id, request.member_id, request.partitions)
+    return ConsumerGroupMemberRequest(
+        member_id=member.member_id,
+        assigned_partitions=member.assigned_partitions
+    )
+
+
+@app.post("/consumer-groups/{group_id}/heartbeat")
+async def heartbeat_member(group_id: str, member_id: str):
+    """Send heartbeat for a member."""
+    manager = get_consumer_group_manager()
+    success = manager.heartbeat(group_id, member_id)
+    if not success:
+        raise HTTPException(status_code=404, detail=f"Member '{member_id}' not found in group '{group_id}'")
+    return {"status": "heartbeat_ok", "group_id": group_id, "member_id": member_id}
+
+
+@app.post("/consumer-groups/{group_id}/read", response_model=ConsumerGroupReadResponse)
+async def read_for_consumer_group(group_id: str, request: ConsumerGroupReadRequest):
+    """Read records from a partition for a consumer group."""
+    manager = get_consumer_group_manager()
+    records = manager.read_from_partition(request.partition, group_id, request.max_records)
+
+    return ConsumerGroupReadResponse(
+        records=[
+            RecordResponse(offset=offset, timestamp=0, data=data.decode())
+            for offset, data in records
+        ],
+        next_offset=records[-1][0] + 1 if records else 0
+    )
+
+
+@app.post("/consumer-groups/{group_id}/commit")
+async def commit_consumer_group_offset(group_id: str, partition: str, offset: int):
+    """Commit offset for a consumer group."""
+    manager = get_consumer_group_manager()
+    group = manager.get_group(group_id)
+    if not group:
+        raise HTTPException(status_code=404, detail=f"Consumer group '{group_id}' not found")
+    group.commit_offset(partition, offset)
+    return {"status": "committed", "group_id": group_id, "partition": partition, "offset": offset}
+
+
+@app.get("/consumer-groups/{group_id}/lag", response_model=ConsumerGroupLagResponse)
+async def get_consumer_group_lag(group_id: str, partition: str):
+    """Get lag for a consumer group on a partition."""
+    manager = get_consumer_group_manager()
+    log = get_log()
+    group = manager.get_group(group_id)
+    if not group:
+        raise HTTPException(status_code=404, detail=f"Consumer group '{group_id}' not found")
+    return ConsumerGroupLagResponse(
+        partition=partition,
+        high_watermark=log.high_watermark,
+        group_offsets={group_id: group.get_offset(partition)}
+    )
+
+
+@app.get("/consumer-groups/lag", response_model=ConsumerGroupLagResponse)
+async def get_all_consumer_group_lags(partition: str):
+    """Get lag for all consumer groups on a partition."""
+    manager = get_consumer_group_manager()
+    log = get_log()
+    lags = manager.get_all_group_lags(partition, log.high_watermark)
+    return ConsumerGroupLagResponse(
+        partition=partition,
+        high_watermark=log.high_watermark,
+        group_offsets=lags
+    )
 
 
 # ==================== Health ====================

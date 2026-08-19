@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, day3/**, day4/**]
+    branches: [main, day3/**, day4/**, day5/**]
   pull_request:
     branches: [main]
 
@@ -138,11 +138,89 @@ from services.broker.lru_cache import LRUCache, SegmentCache
 print('✓ All imports successful in Docker image')
 "
 
+  backpressure-test:
+    name: Backpressure Load Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [test]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Start broker
+        run: |
+          python -m services.broker.server &
+          BROKER_PID=$!
+          sleep 3
+          echo "BROKER_PID=$BROKER_PID" >> $GITHUB_ENV
+
+      - name: Run backpressure load test
+        run: |
+          python scripts/load_test_backpressure.py --base-url http://localhost:8000 --duration 30 --rate 500 --burst-rate 2000 --burst-duration 5
+
+      - name: Stop broker
+        if: always()
+        run: |
+          kill $BROKER_PID || true
+
+  backpressure-alert:
+    name: Backpressure Alert Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [test]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Start broker
+        run: |
+          python -m services.broker.server &
+          BROKER_PID=$!
+          sleep 3
+          echo "BROKER_PID=$BROKER_PID" >> $GITHUB_ENV
+
+      - name: Inject test latency to trigger backpressure
+        run: |
+          python scripts/check_backpressure_alert.py --base-url http://localhost:8000 --inject-latency 200 --wait-bp --timeout 30
+
+      - name: Verify alert fires
+        run: |
+          python scripts/check_backpressure_alert.py --base-url http://localhost:8000 --threshold 100
+
+      - name: Stop broker
+        if: always()
+        run: |
+          kill $BROKER_PID || true
+
   docker-push:
     name: Docker Push to Registry
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    needs: [test, benchmark, cache-correctness, docker]
+    needs: [test, benchmark, cache-correctness, docker, backpressure-test, backpressure-alert]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     permissions:
       contents: read

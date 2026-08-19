@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>StreamCore Backpressure Load Test</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <style>
+    :root {
+      --surface: #ffffff;
+      --surface-dark: #0f172a;
+      --text-primary: #1e293b;
+      --text-secondary: #64748b;
+      --text-muted: #94a3b8;
+      --grid: #e2e8f0;
+      --grid-dark: #1e293b;
+      --phase-warmup: #3b82f6;
+      --phase-burst: #ef4444;
+      --phase-recovery: #22c55e;
+      --line-target: #64748b;
+      --line-actual: #1e293b;
+      --line-p50: #3b82f6;
+      --line-p99: #ef4444;
+      --bp-marker: #f59e0b;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --surface: #0f172a;
+        --surface-dark: #020617;
+        --text-primary: #f1f5f9;
+        --text-secondary: #94a3b8;
+        --text-muted: #64748b;
+        --grid: #1e293b;
+        --grid-dark: #334155;
+        --line-target: #94a3b8;
+        --line-actual: #f1f5f9;
+      }
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: var(--surface); color: var(--text-primary); min-height: 100vh; padding: 24px; }
+    .container { max-width: 900px; margin: 0 auto; }
+    h1 { font-size: 1.5rem; font-weight: 600; margin-bottom: 8px; }
+    .subtitle { color: var(--text-secondary); margin-bottom: 24px; font-size: 0.95rem; }
+    .chart-wrapper { background: var(--surface); border: 1px solid var(--grid); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+    .chart-row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    @media (max-width: 700px) { .chart-row { grid-template-columns: 1fr; } }
+    .phase-legend { display: flex; gap: 16px; justify-content: center; margin-top: 12px; flex-wrap: wrap; }
+    .phase-item { display: flex; align-items: center; gap: 6px; font-size: 0.8rem; color: var(--text-secondary); }
+    .phase-dot { width: 8px; height: 8px; border-radius: 50%; }
+    .stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-top: 16px; }
+    @media (max-width: 600px) { .stats-grid { grid-template-columns: repeat(2, 1fr); } }
+    .stat-card { background: var(--surface); border: 1px solid var(--grid); border-radius: 8px; padding: 12px; text-align: center; }
+    .stat-value { font-size: 1.5rem; font-weight: 700; color: var(--text-primary); }
+    .stat-label { font-size: 0.7rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; margin-top: 4px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>StreamCore Backpressure Load Test</h1>
+    <p class="subtitle">30s test · 500 RPS warmup → 2000 RPS burst (10–15s) → 500 RPS recovery · Backpressure activates at ~12s</p>
+
+    <div class="chart-wrapper">
+      <canvas id="rateChart" height="200"></canvas>
+    </div>
+
+    <div class="chart-wrapper">
+      <canvas id="latencyChart" height="200"></canvas>
+    </div>
+
+    <div class="phase-legend">
+      <div class="phase-item"><span class="phase-dot" style="background: var(--phase-warmup)"></span>Warmup (0–10s)</div>
+      <div class="phase-item"><span class="phase-dot" style="background: var(--phase-burst)"></span>Burst (10–15s)</div>
+      <div class="phase-item"><span class="phase-dot" style="background: var(--phase-recovery)"></span>Recovery (15–30s)</div>
+      <div class="phase-item"><span class="phase-dot" style="background: var(--bp-marker)"></span>Backpressure activates</div>
+    </div>
+
+    <div class="stats-grid">
+      <div class="stat-card">
+        <div class="stat-value" style="color: var(--phase-burst)">2000</div>
+        <div class="stat-label">Peak Target RPS</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-value" style="color: var(--line-p99)">~480</div>
+        <div class="stat-label">P99 Latency (ms)</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-value" style="color: var(--bp-marker)">12s</div>
+        <div class="stat-label">BP Activation</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-value" style="color: var(--phase-recovery)">~500</div>
+        <div class="stat-label">Stabilized Throughput</div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // Generate synthetic data matching the load test pattern
+    function generateData() {
+      const points = 301; // 0-30s at 0.1s intervals
+      const time = Array.from({ length: points }, (_, i) => i * 0.1);
+
+      const targetRate = time.map(t => {
+        if (t < 10) return 500;
+        if (t < 15) return 2000;
+        return 500;
+      });
+
+      // Actual rate: follows target but capped during backpressure
+      const actualRate = time.map((t, i) => {
+        const target = targetRate[i];
+        if (t < 12) return target * 0.98; // slight variance
+        if (t < 18) return 500; // backpressure caps at ~500
+        return target * 0.98;
+      });
+
+      // Latency: low during warmup, spikes during burst, stabilizes with backpressure
+      const p50 = time.map(t => {
+        if (t < 10) return 2 + Math.random() * 1;
+        if (t < 12) return 15 + Math.random() * 10; // building up
+        if (t < 15) return 45 + Math.random() * 15; // spike
+        if (t < 18) return 35 + Math.random() * 10; // backpressure working
+        return 3 + Math.random() * 2; // recovered
+      });
+
+      const p99 = time.map(t => {
+        if (t < 10) return 8 + Math.random() * 4;
+        if (t < 12) return 80 + Math.random() * 40;
+        if (t < 15) return 380 + Math.random() * 100; // bad spike without BP
+        if (t < 18) return 180 + Math.random() * 60; // BP caps it
+        return 12 + Math.random() * 6;
+      });
+
+      // Backpressure active periods
+      const bpActive = time.map(t => t >= 12 && t < 23);
+
+      return { time, targetRate, actualRate, p50, p99, bpActive };
+    }
+
+    const { time, targetRate, actualRate, p50, p99, bpActive } = generateData();
+
+    // Phase background annotations
+    const phaseAnnotations = {
+      type: 'box',
+      xMin: 0, xMax: 10,
+      backgroundColor: 'rgba(59, 130, 246, 0.06)',
+      borderColor: 'transparent',
+      borderWidth: 0,
+    };
+    const phaseAnnotations2 = {
+      type: 'box',
+      xMin: 10, xMax: 15,
+      backgroundColor: 'rgba(239, 68, 68, 0.06)',
+      borderColor: 'transparent',
+      borderWidth: 0,
+    };
+    const phaseAnnotations3 = {
+      type: 'box',
+      xMin: 15, xMax: 30,
+      backgroundColor: 'rgba(34, 197, 94, 0.06)',
+      borderColor: 'transparent',
+      borderWidth: 0,
+    };
+    const bpAnnotation = {
+      type: 'line',
+      mode: 'vertical',
+      scaleID: 'x',
+      value: 12,
+      borderColor: 'rgba(245, 158, 11, 0.6)',
+      borderWidth: 2,
+      borderDash: [6, 4],
+      label: {
+        enabled: true,
+        content: 'Backpressure activates',
+        position: 'start',
+        backgroundColor: 'rgba(245, 158, 11, 0.9)',
+        color: '#fff',
+        font: { size: 10, weight: '600' },
+        padding: 4,
+        cornerRadius: 3
+      }
+    };
+
+    const commonOptions = {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          backgroundColor: 'rgba(15, 23, 42, 0.95)',
+          titleColor: '#f1f5f9',
+          bodyColor: '#cbd5e1',
+          padding: 10,
+          cornerRadius: 6,
+          displayColors: true,
+          callbacks: {
+            label: ctx => `  ${ctx.dataset.label}: ${ctx.parsed.y.toFixed(1)}${ctx.dataset.id.includes('rate') ? ' RPS' : ' ms'}`
+          }
+        },
+        annotation: {
+          annotations: {
+            phase1: phaseAnnotations,
+            phase2: phaseAnnotations2,
+            phase3: phaseAnnotations3,
+            bpLine: bpAnnotation
+          }
+        }
+      },
+      scales: {
+        x: {
+          type: 'linear',
+          min: 0, max: 30,
+          title: { display: true, text: 'Time (seconds)', color: '#64748b', font: { size: 11, weight: '500' } },
+          grid: { color: '#e2e8f0', drawBorder: false },
+          ticks: { color: '#94a3b8', font: { size: 10 }, stepSize: 5 }
+        },
+        y: {
+          title: { display: true, text: 'Requests/sec', color: '#64748b', font: { size: 11, weight: '500' } },
+          grid: { color: '#e2e8f0', drawBorder: false },
+          ticks: { color: '#94a3b8', font: { size: 10 } },
+          min: 0
+        }
+      },
+      elements: {
+        line: { tension: 0.2, borderWidth: 2 },
+        point: { radius: 0, hitRadius: 8, hoverRadius: 5 }
+      }
+    };
+
+    // Rate Chart
+    new Chart(document.getElementById('rateChart'), {
+      type: 'line',
+      data: {
+        labels: time,
+        datasets: [
+          {
+            id: 'targetRate',
+            label: 'Target Rate',
+            data: targetRate,
+            borderColor: '#64748b',
+            borderDash: [4, 4],
+            borderWidth: 1.5,
+            backgroundColor: 'transparent',
+            pointRadius: 0
+          },
+          {
+            id: 'actualRate',
+            label: 'Actual Throughput',
+            data: actualRate,
+            borderColor: '#1e293b',
+            backgroundColor: 'rgba(30, 41, 59, 0.08)',
+            fill: true,
+            borderWidth: 2
+          }
+        ]
+      },
+      options: {
+        ...commonOptions,
+        scales: {
+          ...commonOptions.scales,
+          y: { ...commonOptions.scales.y, max: 2200 }
+        }
+      }
+    });
+
+    // Latency Chart
+    new Chart(document.getElementById('latencyChart'), {
+      type: 'line',
+      data: {
+        labels: time,
+        datasets: [
+          {
+            id: 'p50',
+            label: 'P50 Latency',
+            data: p50,
+            borderColor: '#3b82f6',
+            backgroundColor: 'rgba(59, 130, 246, 0.08)',
+            fill: true,
+            borderWidth: 2
+          },
+          {
+            id: 'p99',
+            label: 'P99 Latency',
+            data: p99,
+            borderColor: '#ef4444',
+            backgroundColor: 'rgba(239, 68, 68, 0.06)',
+            borderWidth: 2,
+            fill: false
+          }
+        ]
+      },
+      options: {
+        ...commonOptions,
+        scales: {
+          ...commonOptions.scales,
+          y: {
+            ...commonOptions.scales.y,
+            title: { display: true, text: 'Latency (ms)', color: '#64748b', font: { size: 11, weight: '500' } },
+            max: 500
+          }
+        }
+      }
+    });
+  </script>
+</body>
+</html>

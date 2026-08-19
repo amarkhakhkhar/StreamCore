@@ -6,6 +6,7 @@ A lightweight broker service exposing the partition log via HTTP API.
 
 import asyncio
 import os
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
@@ -15,10 +16,14 @@ from pydantic import BaseModel
 
 from .partition_log import PartitionLog
 from .routing import RoutingEngine, create_routing_engine
+from .backpressure import BackpressureMiddleware, create_backpressure_middleware
 
 
 # Global partition log instance
 _log: Optional[PartitionLog] = None
+
+# Global backpressure middleware
+_backpressure: Optional[BackpressureMiddleware] = None
 
 
 def get_log() -> PartitionLog:
@@ -44,10 +49,18 @@ async def lifespan(app: FastAPI):
         segment_max_age_ms=segment_max_age_ms
     )
 
+    global _backpressure
+    _backpressure = create_backpressure_middleware(
+        window_ms=int(os.getenv("STREAMCORE_BP_WINDOW_MS", "1000")),
+        trigger_windows=int(os.getenv("STREAMCORE_BP_TRIGGER_WINDOWS", "3")),
+        latency_threshold_ms=float(os.getenv("STREAMCORE_BP_LATENCY_THRESHOLD_MS", "50.0")),
+    )
+
     yield
 
     _log.close()
     _log = None
+    _backpressure = None
 
 
 app = FastAPI(
@@ -202,7 +215,24 @@ def get_routing_engine() -> RoutingEngine:
 async def append_record(request: AppendRequest):
     """Append a record to the partition log."""
     log = get_log()
+
+    # Check backpressure before processing
+    if _backpressure and _backpressure.should_throttle():
+        retry_after = _backpressure.get_retry_after()
+        raise HTTPException(
+            status_code=429,
+            detail="Backpressure active - broker overloaded, slow down",
+            headers={"Retry-After": str(retry_after or 1000)}
+        )
+
+    start_time = time.time()
     offset = log.append(request.data.encode(), request.timestamp)
+    latency_ms = (time.time() - start_time) * 1000
+
+    # Record latency for backpressure tracking
+    if _backpressure:
+        _backpressure.record_append_latency(latency_ms)
+
     return AppendResponse(offset=offset)
 
 
@@ -412,6 +442,36 @@ async def delete_routing_rule(name: str):
     engine = get_routing_engine()
     engine.rules = [r for r in engine.rules if r.name != name]
     return {"status": "deleted", "name": name}
+
+
+# ==================== Backpressure Operations ====================
+
+@app.get("/backpressure/stats")
+async def get_backpressure_stats():
+    """Get backpressure tracking statistics."""
+    if _backpressure is None:
+        raise HTTPException(status_code=503, detail="Backpressure not initialized")
+    return _backpressure.get_stats()
+
+
+@app.post("/backpressure/test/inject-latency")
+async def inject_test_latency(latency_ms: float):
+    """
+    Test endpoint to inject artificial latency for backpressure testing.
+
+    NOTE: This is a test-only endpoint for CI/load-test verification.
+    """
+    if _backpressure is None:
+        raise HTTPException(status_code=503, detail="Backpressure not initialized")
+
+    # Record artificially high latency to simulate load
+    _backpressure.record_append_latency(latency_ms)
+
+    return {
+        "injected_ms": latency_ms,
+        "backpressure_active": _backpressure.should_throttle(),
+        "stats": _backpressure.get_stats()
+    }
 
 
 # ==================== Health ====================

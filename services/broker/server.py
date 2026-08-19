@@ -135,6 +135,18 @@ class LaggingConsumersResponse(BaseModel):
     lagging_consumers: list[str]
 
 
+class CacheStatsResponse(BaseModel):
+    """Cache statistics response."""
+    size: int
+    capacity: int
+    hits: int
+    misses: int
+    evictions: int
+    total_requests: int
+    hit_rate: float
+    miss_rate: float
+
+
 # ==================== Log Operations ====================
 
 @app.post("/append", response_model=AppendResponse)
@@ -253,6 +265,24 @@ async def get_lagging_consumers(threshold: int = 100):
         threshold=threshold,
         lagging_consumers=lagging
     )
+
+
+# ==================== Cache Operations ====================
+
+@app.get("/cache/stats", response_model=CacheStatsResponse)
+async def get_cache_stats():
+    """Get LRU segment cache statistics."""
+    log = get_log()
+    stats = log.get_cache_stats()
+    return CacheStatsResponse(**stats)
+
+
+@app.post("/cache/clear")
+async def clear_cache():
+    """Clear the LRU segment cache."""
+    log = get_log()
+    log.clear_cache()
+    return {"status": "cleared"}
 
 
 # ==================== Health ====================

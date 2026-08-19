@@ -14,6 +14,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from .partition_log import PartitionLog
+from .routing import RoutingEngine, create_routing_engine
 
 
 # Global partition log instance
@@ -145,6 +146,54 @@ class CacheStatsResponse(BaseModel):
     total_requests: int
     hit_rate: float
     miss_rate: float
+
+
+# ==================== Routing Models ====================
+
+class RouteRequest(BaseModel):
+    """Request to route a message."""
+    topic: str
+    data: str
+    headers: dict[str, str] = {}
+
+
+class RouteResponse(BaseModel):
+    """Response with routing decision."""
+    topic: str
+    target: str
+    matched_rule: Optional[str] = None
+
+
+class RoutingRuleRequest(BaseModel):
+    """Request to add a routing rule."""
+    name: str
+    expression: str
+    target: str
+
+
+class RoutingRuleResponse(BaseModel):
+    """Routing rule information."""
+    name: str
+    expression: str
+    target: str
+
+
+class RoutingRulesResponse(BaseModel):
+    """All routing rules."""
+    rules: list[RoutingRuleResponse]
+    default_target: str
+
+
+# Global routing engine
+_routing_engine: Optional[RoutingEngine] = None
+
+
+def get_routing_engine() -> RoutingEngine:
+    """Get the global routing engine instance."""
+    global _routing_engine
+    if _routing_engine is None:
+        _routing_engine = create_routing_engine()
+    return _routing_engine
 
 
 # ==================== Log Operations ====================
@@ -283,6 +332,86 @@ async def clear_cache():
     log = get_log()
     log.clear_cache()
     return {"status": "cleared"}
+
+
+# ==================== Routing Operations ====================
+
+@app.post("/route", response_model=RouteResponse)
+async def route_message(request: RouteRequest):
+    """Route a message to a topic/partition based on routing rules."""
+    engine = get_routing_engine()
+
+    message = {
+        "topic": request.topic,
+        "data": request.data,
+        "headers": request.headers
+    }
+
+    target = engine.route(message)
+
+    # Find which rule matched (for debugging)
+    matched_rule = None
+    for rule in engine.rules:
+        if rule.matches(message):
+            matched_rule = rule.name
+            break
+
+    return RouteResponse(
+        topic=request.topic,
+        target=target,
+        matched_rule=matched_rule
+    )
+
+
+@app.post("/route/batch", response_model=list[RouteResponse])
+async def route_batch(requests: list[RouteRequest]):
+    """Route a batch of messages."""
+    engine = get_routing_engine()
+
+    messages = [
+        {"topic": r.topic, "data": r.data, "headers": r.headers}
+        for r in requests
+    ]
+
+    results = engine.route_batch(messages)
+
+    return [
+        RouteResponse(
+            topic=r["topic"],
+            target=target,
+            matched_rule=next((rule.name for rule in engine.rules if rule.matches(r)), None)
+        )
+        for r, target in results
+    ]
+
+
+@app.get("/routing/rules", response_model=RoutingRulesResponse)
+async def get_routing_rules():
+    """Get all routing rules."""
+    engine = get_routing_engine()
+    return RoutingRulesResponse(
+        rules=[
+            RoutingRuleResponse(name=rule.name, expression=rule.expression, target=rule.target)
+            for rule in engine.rules
+        ],
+        default_target=engine.default_target
+    )
+
+
+@app.post("/routing/rules", response_model=RoutingRuleResponse)
+async def add_routing_rule(request: RoutingRuleRequest):
+    """Add a new routing rule."""
+    engine = get_routing_engine()
+    engine.add_rule(request.name, request.expression, request.target)
+    return RoutingRuleResponse(name=request.name, expression=request.expression, target=request.target)
+
+
+@app.delete("/routing/rules/{name}")
+async def delete_routing_rule(name: str):
+    """Delete a routing rule by name."""
+    engine = get_routing_engine()
+    engine.rules = [r for r in engine.rules if r.name != name]
+    return {"status": "deleted", "name": name}
 
 
 # ==================== Health ====================

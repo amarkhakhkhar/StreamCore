@@ -20,6 +20,7 @@ from typing import Iterator, List, Optional
 
 from .segment import Record, Segment, SegmentNode
 from .lru_cache import SegmentCache
+from .time_index import TimeIndex, create_time_index, rebuild_time_index, seek_batch_mmap
 
 
 @dataclass
@@ -139,6 +140,7 @@ class PartitionLog:
     log_dir: Path
     segment_max_size: int = 1024 * 1024 * 1024  # 1GB
     segment_max_age_ms: int = 0  # 0 = no time-based rotation
+    time_index_sparse_bytes: int = 0  # 0 = dense (every record), >0 = sparse index
 
     # Linked list: head sentinel <-> segments <-> tail sentinel
     _head: SegmentNode = field(default=None, repr=False)
@@ -233,6 +235,9 @@ class PartitionLog:
             max_size=self.segment_max_size
         )
 
+        # Create time index for this segment
+        time_index = create_time_index(segment_path, base_offset, sparse_bytes=self.time_index_sparse_bytes)
+
         node = SegmentNode(segment=segment)
 
         # Insert before tail sentinel
@@ -252,6 +257,20 @@ class PartitionLog:
             self._active_segment_created_at = int(time.time() * 1000)
 
         return node
+
+    def _get_or_build_time_index(self, segment: Segment) -> TimeIndex:
+        """Get or build time index for a segment."""
+        index_path = segment.path.with_suffix(".timeindex")
+        time_index = TimeIndex(path=index_path, base_offset=segment.base_offset)
+        if not time_index._loaded:
+            # Missing index file - build a fresh one
+            rebuild_time_index(segment.path, segment.base_offset, sparse_bytes=self.time_index_sparse_bytes)
+            time_index = TimeIndex(path=index_path, base_offset=segment.base_offset)
+        elif segment.is_sealed and time_index.is_complete and time_index.record_count != segment.record_count:
+            # Sealed segment with stale/incomplete index - rebuild
+            rebuild_time_index(segment.path, segment.base_offset, sparse_bytes=self.time_index_sparse_bytes)
+            time_index = TimeIndex(path=index_path, base_offset=segment.base_offset)
+        return time_index
 
     def _should_rotate_segment(self) -> tuple[bool, str]:
         """
@@ -283,6 +302,8 @@ class PartitionLog:
             if self._active and self._active.segment:
                 sealed_segment = self._active.segment
                 sealed_segment.seal()
+                # Rebuild time index for the sealed segment with sparse indexing
+                rebuild_time_index(sealed_segment.path, sealed_segment.base_offset, sparse_bytes=self.time_index_sparse_bytes)
             self._create_active_segment(base_offset=self._next_offset)
             self._rotation_count += 1
             self._last_rotation_reason = reason
@@ -314,6 +335,10 @@ class PartitionLog:
             )
 
             self._active.segment.append(record)
+            # Also append to time index for the active segment
+            time_index = self._get_or_build_time_index(self._active.segment)
+            time_index.append(timestamp, self._next_offset - self._active.segment.base_offset)
+
             self._next_offset += 1
 
             return record.offset
@@ -388,6 +413,99 @@ class PartitionLog:
         for record in self.read(start_offset=offset, max_records=1):
             return record
         return None
+
+    # ==================== Time-based Seek ====================
+
+    def seek_by_timestamp(self, target_timestamp: int) -> Optional[int]:
+        """
+        Find the offset of the first record with timestamp >= target_timestamp.
+
+        Uses the per-segment time index for O(log n) binary search per segment.
+        Returns the absolute offset, or None if no record meets the condition.
+
+        This is the core primitive behind "give me all records since 3 PM".
+        """
+        with self._lock:
+            # Walk segments in order (oldest first)
+            current = self._head.next
+            while current != self._tail:
+                segment = current.segment
+                if segment is None:
+                    current = current.next
+                    continue
+
+                time_index = self._get_or_build_time_index(segment)
+                relative_offset = time_index.find_first_ge(target_timestamp)
+
+                if relative_offset is not None:
+                    absolute_offset = segment.base_offset + relative_offset
+                    # Found a candidate in this segment; since segments are
+                    # ordered by time (append order, monotonic timestamps in
+                    # practice), the first segment with a match is the answer.
+                    return absolute_offset
+
+                current = current.next
+
+        return None
+
+    def seek_batch_by_timestamp(self, timestamps: list[int]) -> list[Optional[int]]:
+        """
+        Find offsets for multiple timestamps in a single pass.
+
+        Sorts queries internally to walk segments once, using mmap for fast binary searches.
+        Returns results in the same order as input timestamps.
+
+        This is the core primitive behind "give me offsets for all these timestamps at once".
+        """
+        if not timestamps:
+            return []
+
+        with self._lock:
+            # Walk segments in order (oldest first)
+            segments = []
+            current = self._head.next
+            while current != self._tail:
+                segment = current.segment
+                if segment is not None:
+                    segments.append(segment)
+                current = current.next
+
+            if not segments:
+                return [None] * len(timestamps)
+
+            # Pair each timestamp with its original index and sort
+            indexed = [(ts, i) for i, ts in enumerate(timestamps)]
+            indexed.sort(key=lambda x: x[0])
+
+            results = [None] * len(timestamps)
+
+            # For each segment, process all timestamps that fall in it
+            seg_idx = 0
+            for target_ts, orig_idx in indexed:
+                # Find the segment that could contain this timestamp
+                while seg_idx < len(segments):
+                    segment = segments[seg_idx]
+                    time_index = self._get_or_build_time_index(segment)
+
+                    # Check if target could be in this segment
+                    if target_ts <= time_index.max_timestamp or time_index.max_timestamp is None:
+                        # Search in this segment using mmap
+                        rel_off = time_index.find_first_ge_mmap(target_ts)
+                        if rel_off is not None:
+                            results[orig_idx] = segment.base_offset + rel_off
+                        else:
+                            # Not in this segment, but could be in next
+                            pass
+                        break
+                    seg_idx += 1
+
+                if seg_idx >= len(segments):
+                    # Past all segments - remaining timestamps are after all records
+                    for _, remaining_idx in indexed[indexed.index((target_ts, orig_idx)):]:
+                        results[remaining_idx] = None
+                    break
+
+            return results
 
     # ==================== Consumer Lag API ====================
 

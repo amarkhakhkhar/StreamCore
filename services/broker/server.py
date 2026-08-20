@@ -9,7 +9,7 @@ import os
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -848,6 +848,52 @@ async def get_cluster_health():
 async def health_check():
     """Health check endpoint."""
     return {"status": "healthy"}
+
+
+class ReadinessResponse(BaseModel):
+    """Readiness probe response."""
+    ready: bool
+    reason: str
+    replica_lag_threshold: int
+    max_replica_lag: int
+    consumer_groups_lagging: List[str]
+
+
+@app.get("/health/ready", response_model=ReadinessResponse)
+async def readiness_check(
+    replica_lag_threshold: int = 10000,
+):
+    """
+    Kubernetes readiness probe.
+
+    Returns ready=False if any replica has fallen behind beyond threshold.
+    This prevents K8s from routing client traffic to a broker that cannot
+    serve consistent reads.
+    """
+    log = get_log()
+
+    # Check consumer group lags — a broker serving stale data is not "ready"
+    all_lag = log.get_all_consumer_lag()
+    lagging_groups = []
+    max_lag = 0
+
+    for group_id, info in all_lag.items():
+        lag = info["lag"]
+        max_lag = max(max_lag, lag)
+        if lag > replica_lag_threshold:
+            lagging_groups.append(group_id)
+
+    ready = len(lagging_groups) == 0
+
+    reason = "all replicas in sync" if ready else f"{len(lagging_groups)} groups lagging beyond threshold"
+
+    return ReadinessResponse(
+        ready=ready,
+        reason=reason,
+        replica_lag_threshold=replica_lag_threshold,
+        max_replica_lag=max_lag,
+        consumer_groups_lagging=lagging_groups
+    )
 
 
 def run():

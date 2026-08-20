@@ -17,9 +17,9 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator, List, Optional
-import os
 
 from .segment import Record, Segment, SegmentNode
+from .lru_cache import SegmentCache
 
 
 @dataclass
@@ -45,6 +45,8 @@ class ConsumerLag:
 
     def update_committed_offset(self, offset: int) -> None:
         """Consumer commits they've processed up to this offset."""
+        if offset < self.committed_offset:
+            return
         self.committed_offset = offset
         self.last_heartbeat_ms = int(time.time() * 1000)
 
@@ -113,8 +115,9 @@ class LagDetector:
         """Get list of consumers that are lagging beyond threshold."""
         with self._lock:
             lagging = []
-            for consumer_id in self.consumers:
-                if self.is_lagging(consumer_id, high_watermark, threshold):
+            for consumer_id, consumer in self.consumers.items():
+                if high_watermark - consumer.committed_offset > threshold:
+                    consumer._current_lag = high_watermark - consumer.committed_offset
                     lagging.append(consumer_id)
             return lagging
 
@@ -153,6 +156,12 @@ class PartitionLog:
     # Rotation statistics
     _rotation_count: int = field(default=0, repr=False)
     _last_rotation_reason: str = field(default="", repr=False)
+
+    # LRU segment cache for read optimization
+    _segment_cache: SegmentCache = field(
+        default_factory=lambda: SegmentCache(capacity=10),
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         """Initialize the partition log with sentinel nodes."""
@@ -272,8 +281,8 @@ class PartitionLog:
         """Seal current active segment and create a new one."""
         with self._lock:
             if self._active and self._active.segment:
-                self._active.segment.seal()
-
+                sealed_segment = self._active.segment
+                sealed_segment.seal()
             self._create_active_segment(base_offset=self._next_offset)
             self._rotation_count += 1
             self._last_rotation_reason = reason
@@ -310,44 +319,69 @@ class PartitionLog:
             return record.offset
 
     def read(self, start_offset: int = 0, max_records: int = -1) -> Iterator[Record]:
-        """
-        Read records from the partition log in exact write order.
+        """Read records in exact write order with bounded segment caching."""
+        if start_offset < 0:
+            raise ValueError("start_offset must be non-negative")
+        if max_records == 0:
+            return
 
-        Args:
-            start_offset: The offset to start reading from
-            max_records: Maximum number of records to read (-1 for all)
-
-        Yields:
-            Record objects in exact append order
-        """
         with self._lock:
-            # Find the segment containing start_offset
+            segments = []
             current = self._head.next
-            records_yielded = 0
-
             while current != self._tail:
-                if current.segment is None:
-                    current = current.next
-                    continue
-
-                seg = current.segment
-
-                # Check if this segment could contain our start offset
-                if seg.base_offset + seg.record_count <= start_offset:
-                    current = current.next
-                    continue
-
-                # Calculate relative offset within this segment
-                relative_start = max(0, start_offset - seg.base_offset)
-
-                # Read from this segment
-                for record in seg.read(start_offset=relative_start):
-                    if max_records > 0 and records_yielded >= max_records:
-                        return
-                    yield record
-                    records_yielded += 1
-
+                segment = current.segment
+                if segment is not None:
+                    segment_end = segment.base_offset + segment.record_count
+                    if segment_end > start_offset:
+                        segments.append(segment)
                 current = current.next
+
+        records_yielded = 0
+        for segment in segments:
+            relative_start = max(0, start_offset - segment.base_offset)
+            remaining = max_records - records_yielded if max_records > 0 else -1
+            if remaining == 0:
+                return
+
+            if segment.is_sealed:
+                cached_segment = self._segment_cache.get_segment(segment.base_offset)
+                if cached_segment is not None and cached_segment._get_cached_records() is not None:
+                    segment = cached_segment
+                else:
+                    # Cache only bounded-size immutable segments. Large segments are
+                    # streamed directly so a small read never forces a full scan into RAM.
+                    if segment.size <= self._segment_cache.max_cacheable_bytes:
+                        records = segment._read_from_disk()
+                        if len(records) == segment.record_count:
+                            segment.cache_records(records)
+                            self._segment_cache.put_segment(segment.base_offset, segment)
+                            end = min(
+                                len(records),
+                                relative_start + remaining if remaining > 0 else len(records),
+                            )
+                            for record in records[relative_start:end]:
+                                yield record
+                                records_yielded += 1
+                            continue
+
+                    for record in segment.read(
+                        start_offset=relative_start,
+                        max_records=remaining,
+                    ):
+                        yield record
+                        records_yielded += 1
+                        if max_records > 0 and records_yielded >= max_records:
+                            return
+                    continue
+
+            for record in segment.read(
+                start_offset=relative_start,
+                max_records=remaining,
+            ):
+                yield record
+                records_yielded += 1
+                if max_records > 0 and records_yielded >= max_records:
+                    return
 
     def read_at(self, offset: int) -> Optional[Record]:
         """Read a single record at the given offset."""
@@ -455,3 +489,28 @@ class PartitionLog:
             "segment_max_age_ms": self.segment_max_age_ms,
             "active_segment_age_ms": int(time.time() * 1000) - self._active_segment_created_at if self._active else 0
         }
+
+    # ==================== LRU Cache API ====================
+
+    def get_cache_stats(self) -> dict:
+        """Get LRU segment cache statistics."""
+        return self._segment_cache.get_stats_snapshot()
+
+    def clear_cache(self) -> None:
+        """Clear the segment cache."""
+        self._segment_cache.clear()
+
+    @property
+    def cache_hit_rate(self) -> float:
+        """Return the current cache hit rate."""
+        return self._segment_cache.hit_rate
+
+    @property
+    def cache_size(self) -> int:
+        """Return the current cache size."""
+        return self._segment_cache.size
+
+    @property
+    def cache_capacity(self) -> int:
+        """Return the cache capacity."""
+        return self._segment_cache.capacity

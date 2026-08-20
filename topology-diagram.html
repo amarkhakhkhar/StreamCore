@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>StreamCore Cluster Topology</title>
+    <style>
+        :root {
+            --bg: #0d1117;
+            --fg: #e6edf3;
+            --muted: #8b949e;
+            --accent: #58a6ff;
+            --warning: #d29922;
+            --success: #3fb950;
+            --card: #161b22;
+            --border: #30363d;
+            --leader: #f78166;
+            --replica: #a5d6ff;
+            --b0: #ffa657;
+            --b1: #7ee787;
+            --b2: #d2a8ff;
+        }
+        @media (prefers-color-scheme: light) {
+            :root {
+                --bg: #ffffff;
+                --fg: #1f2328;
+                --muted: #656d76;
+                --accent: #0969da;
+                --warning: #9a6700;
+                --success: #1a7f37;
+                --card: #f6f8fa;
+                --border: #d0d7de;
+                --leader: #cf222e;
+                --replica: #0969da;
+                --b0: #9a6700;
+                --b1: #1a7f37;
+                --b2: #8250df;
+            }
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+            background: var(--bg);
+            color: var(--fg);
+            min-height: 100vh;
+            padding: 2rem;
+            line-height: 1.5;
+        }
+        .container { max-width: 1100px; margin: 0 auto; }
+        h1 { font-size: 1.5rem; margin-bottom: 0.25rem; }
+        .subtitle { color: var(--muted); margin-bottom: 1.5rem; }
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+            gap: 0.75rem;
+            margin-bottom: 1.5rem;
+        }
+        .stat {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 0.75rem 1rem;
+        }
+        .stat-label { font-size: 0.7rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
+        .stat-value { font-size: 1.25rem; font-weight: 700; }
+        .stat-value.accent { color: var(--accent); }
+        .stat-value.success { color: var(--success); }
+
+        /* Tree layout */
+        .tree { display: flex; flex-direction: column; align-items: center; gap: 1.5rem; }
+        .level { display: flex; justify-content: center; gap: 1rem; flex-wrap: wrap; position: relative; }
+        .level:not(:first-child)::before {
+            content: '';
+            position: absolute;
+            top: -1.5rem;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 2px;
+            height: 1.5rem;
+            background: var(--border);
+        }
+
+        .node {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 0.25rem;
+            padding: 0.75rem 1rem;
+            background: var(--bg);
+            border: 2px solid var(--border);
+            border-radius: 6px;
+            min-width: 130px;
+            text-align: center;
+        }
+        .node.topic { border-color: var(--accent); }
+        .node.partition { border-color: var(--warning); }
+        .node.broker { border-color: var(--muted); }
+        .node.broker.leader { border-color: var(--leader); }
+        .node.broker.replica { border-color: var(--replica); }
+        .node-type { font-size: 0.65rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
+        .node-name { font-size: 0.9rem; font-weight: 600; }
+        .node-meta { font-size: 0.7rem; color: var(--muted); }
+        .badge {
+            display: inline-block;
+            padding: 0.1rem 0.4rem;
+            border-radius: 9999px;
+            font-size: 0.6rem;
+            font-weight: 600;
+        }
+        .badge-leader { background: var(--leader); color: white; }
+        .badge-replica { background: var(--replica); color: var(--bg); }
+
+        /* Connectors between partition and broker rows */
+        .connector-row {
+            display: flex;
+            justify-content: center;
+            gap: 1rem;
+            height: 1rem;
+            margin-top: -0.75rem;
+            pointer-events: none;
+        }
+        .connector {
+            width: 2px;
+            height: 100%;
+            background: var(--border);
+            position: relative;
+        }
+        .connector::after {
+            content: '';
+            position: absolute;
+            bottom: 0;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 6px;
+            height: 6px;
+            border-right: 2px solid var(--border);
+            border-bottom: 2px solid var(--border);
+            background: var(--bg);
+            transform: translateX(-50%) rotate(45deg);
+        }
+
+        /* Failure scenario */
+        .failure-badge {
+            display: inline-block;
+            padding: 0.15rem 0.5rem;
+            background: var(--leader);
+            color: white;
+            border-radius: 3px;
+            font-size: 0.65rem;
+            font-weight: 600;
+            margin-left: 0.5rem;
+        }
+        .failed { opacity: 0.4; text-decoration: line-through; }
+        .promoted { background: rgba(63, 185, 80, 0.15); border-color: var(--success) !important; }
+
+        .legend {
+            display: flex;
+            gap: 1.25rem;
+            margin-top: 2rem;
+            padding-top: 1.5rem;
+            border-top: 1px solid var(--border);
+            justify-content: center;
+            flex-wrap: wrap;
+        }
+        .legend-item { display: flex; align-items: center; gap: 0.4rem; font-size: 0.8rem; color: var(--muted); }
+        .legend-box { width: 14px; height: 14px; border: 2px solid; border-radius: 3px; }
+        .scenario { margin-top: 1.5rem; padding: 1rem; background: var(--card); border: 1px solid var(--border); border-radius: 6px; }
+        .scenario h3 { font-size: 0.85rem; margin-bottom: 0.5rem; }
+        .scenario p { font-size: 0.85rem; color: var(--muted); }
+        .scenario ul { margin-left: 1.25rem; font-size: 0.85rem; color: var(--muted); }
+        .scenario li { margin: 0.25rem 0; }
+        .scenario code { background: var(--bg); padding: 0.1rem 0.3rem; border-radius: 3px; font-size: 0.8rem; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>StreamCore Cluster Topology</h1>
+        <p class="subtitle">Topic → Partition → Replica Broker tree with BFS/DFS leader discovery</p>
+
+        <div class="stats">
+            <div class="stat"><div class="stat-label">Topic</div><div class="stat-value accent">orders</div></div>
+            <div class="stat"><div class="stat-label">Partitions</div><div class="stat-value">6</div></div>
+            <div class="stat"><div class="stat-label">Replication Factor</div><div class="stat-value">2</div></div>
+            <div class="stat"><div class="stat-label">Brokers</div><div class="stat-value">3</div></div>
+            <div class="stat"><div class="stat-label">Status</div><div class="stat-value success">Healthy</div></div>
+            <div class="stat"><div class="stat-label">Under-replicated</div><div class="stat-value success">0</div></div>
+        </div>
+
+        <!-- MAIN TOPOLOGY TREE -->
+        <div class="tree">
+            <!-- Topic Level -->
+            <div class="level">
+                <div class="node topic">
+                    <span class="node-type">Topic</span>
+                    <span class="node-name">orders</span>
+                    <span class="node-meta">6 partitions • RF=2</span>
+                </div>
+            </div>
+
+            <!-- Partition Level -->
+            <div class="level">
+                <div class="node partition"><span class="node-type">Partition</span><span class="node-name">0</span><span class="node-meta">Leader: broker-0 • 2 replicas</span></div>
+                <div class="node partition"><span class="node-type">Partition</span><span class="node-name">1</span><span class="node-meta">Leader: broker-1 • 2 replicas</span></div>
+                <div class="node partition"><span class="node-type">Partition</span><span class="node-name">2</span><span class="node-meta">Leader: broker-2 • 2 replicas</span></div>
+                <div class="node partition"><span class="node-type">Partition</span><span class="node-name">3</span><span class="node-meta">Leader: broker-0 • 2 replicas</span></div>
+                <div class="node partition"><span class="node-type">Partition</span><span class="node-name">4</span><span class="node-meta">Leader: broker-1 • 2 replicas</span></div>
+                <div class="node partition"><span class="node-type">Partition</span><span class="node-name">5</span><span class="node-meta">Leader: broker-2 • 2 replicas</span></div>
+            </div>
+
+            <!-- Broker Level (grouped by partition) -->
+            <div class="level">
+                <div style="display:flex; gap:0.75rem;">
+                    <div class="node broker leader" style="border-color:var(--b0);"><span class="node-type">Broker</span><span class="node-name">broker-0</span><span class="node-meta">streamcore-broker-0:8000 <span class="badge badge-leader">LEADER</span></span></div>
+                    <div class="node broker replica" style="border-color:var(--b1);"><span class="node-type">Broker</span><span class="node-name">broker-1</span><span class="node-meta">streamcore-broker-1:8000 <span class="badge badge-replica">REPLICA</span></span></div>
+                </div>
+                <div style="display:flex; gap:0.75rem;">
+                    <div class="node broker leader" style="border-color:var(--b1);"><span class="node-type">Broker</span><span class="node-name">broker-1</span><span class="node-meta">streamcore-broker-1:8000 <span class="badge badge-leader">LEADER</span></span></div>
+                    <div class="node broker replica" style="border-color:var(--b2);"><span class="node-type">Broker</span><span class="node-name">broker-2</span><span class="node-meta">streamcore-broker-2:8000 <span class="badge badge-replica">REPLICA</span></span></div>
+                </div>
+                <div style="display:flex; gap:0.75rem;">
+                    <div class="node broker leader" style="border-color:var(--b2);"><span class="node-type">Broker</span><span class="node-name">broker-2</span><span class="node-meta">streamcore-broker-2:8000 <span class="badge badge-leader">LEADER</span></span></div>
+                    <div class="node broker replica" style="border-color:var(--b0);"><span class="node-type">Broker</span><span class="node-name">broker-0</span><span class="node-meta">streamcore-broker-0:8000 <span class="badge badge-replica">REPLICA</span></span></div>
+                </div>
+                <div style="display:flex; gap:0.75rem;">
+                    <div class="node broker leader" style="border-color:var(--b0);"><span class="node-type">Broker</span><span class="node-name">broker-0</span><span class="node-meta">streamcore-broker-0:8000 <span class="badge badge-leader">LEADER</span></span></div>
+                    <div class="node broker replica" style="border-color:var(--b1);"><span class="node-type">Broker</span><span class="node-name">broker-1</span><span class="node-meta">streamcore-broker-1:8000 <span class="badge badge-replica">REPLICA</span></span></div>
+                </div>
+                <div style="display:flex; gap:0.75rem;">
+                    <div class="node broker leader" style="border-color:var(--b1);"><span class="node-type">Broker</span><span class="node-name">broker-1</span><span class="node-meta">streamcore-broker-1:8000 <span class="badge badge-leader">LEADER</span></span></div>
+                    <div class="node broker replica" style="border-color:var(--b2);"><span class="node-type">Broker</span><span class="node-name">broker-2</span><span class="node-meta">streamcore-broker-2:8000 <span class="badge badge-replica">REPLICA</span></span></div>
+                </div>
+                <div style="display:flex; gap:0.75rem;">
+                    <div class="node broker leader" style="border-color:var(--b2);"><span class="node-type">Broker</span><span class="node-name">broker-2</span><span class="node-meta">streamcore-broker-2:8000 <span class="badge badge-leader">LEADER</span></span></div>
+                    <div class="node broker replica" style="border-color:var(--b0);"><span class="node-type">Broker</span><span class="node-name">broker-0</span><span class="node-meta">streamcore-broker-0:8000 <span class="badge badge-replica">REPLICA</span></span></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- LEGEND -->
+        <div class="legend">
+            <div class="legend-item"><div class="legend-box" style="border-color:var(--accent);"></div><span>Topic Node</span></div>
+            <div class="legend-item"><div class="legend-box" style="border-color:var(--warning);"></div><span>Partition Node</span></div>
+            <div class="legend-item"><div class="legend-box" style="border-color:var(--leader);"></div><span>Leader Broker</span></div>
+            <div class="legend-item"><div class="legend-box" style="border-color:var(--replica);"></div><span>Replica Broker</span></div>
+        </div>
+
+        <!-- TRAVERSAL EXPLANATION -->
+        <div class="scenario">
+            <h3>Leader Discovery: BFS vs DFS</h3>
+            <p>Both traversals return the same leader for every partition. When they diverge, you have a split-brain bug.</p>
+            <strong>BFS (Queue — Level Order):</strong>
+            <ul>
+                <li>Enqueue Topic → Dequeue → Enqueue all 6 Partitions</li>
+                <li>Dequeue Partition 0 → Match <code>partition_id == "0"</code> ✓ → Return <code>leader_broker_id = broker-0</code></li>
+                <li>Time: O(partitions + replicas) = O(18) worst case</li>
+            </ul>
+            <strong>DFS (Stack — Depth First):</strong>
+            <ul>
+                <li>Push Topic → Pop → Push Partitions [5,4,3,2,1,0] (reversed for correct order)</li>
+                <li>Pop Partition 0 → Match <code>partition_id == "0"</code> ✓ → Return <code>leader_broker_id = broker-0</code></li>
+                <li>Same complexity, different visit order</li>
+            </ul>
+        </div>
+
+        <!-- FAILURE SCENARIO -->
+        <div class="scenario">
+            <h3>Broker Failure & Automatic Reassignment</h3>
+            <p>Replication Factor = 2 means each partition has 1 leader + 1 replica. On leader failure, the replica promotes.</p>
+            <ul>
+                <li><strong>Initial:</strong> Partition 0 leader = <code>broker-0</code>, Partition 3 leader = <code>broker-0</code></li>
+                <li><strong>Kill broker-0:</strong> Mark <span class="badge badge-replica" style="background:var(--leader);">OFFLINE</span>. Scan replicas for Partition 0 & 3.</li>
+                <li><strong>Promote:</strong> Partition 0 → <code>broker-1</code> (was replica). Partition 3 → <code>broker-1</code> (was replica).</li>
+                <li><strong>Kill broker-1:</strong> Partition 0 & 3 → <code>broker-2</code>.</li>
+                <li><strong>Result:</strong> All 6 partitions still available. Cluster health = <span style="color:var(--warning)">degraded</span> (under-replicated), not down.</li>
+            </ul>
+        </div>
+
+        <!-- K8S DISCOVERY -->
+        <div class="scenario">
+            <h3>Kubernetes Headless Service Discovery</h3>
+            <p>No hardcoded IPs. No load balancer. Brokers discover each other via DNS.</p>
+            <ul>
+                <li><strong>StatefulSet</strong> provides stable pod names: <code>streamcore-broker-0</code>, <code>-1</code>, <code>-2</code></li>
+                <li><strong>Headless Service</strong> (<code>clusterIP: None</code>) resolves service name directly to pod IPs</li>
+                <li>Each broker resolves <code>streamcore-broker-headless.streamcore.svc.cluster.local</code> → gets all 3 pod IPs</li>
+                <li>On startup, broker registers itself in cluster topology; others discover it automatically</li>
+                <li>Scale to 4 replicas: just <code>kubectl scale statefulset streamcore-broker --replicas=4</code></li>
+            </ul>
+        </div>
+    </div>
+</body>
+</html>

@@ -18,6 +18,7 @@ from .partition_log import PartitionLog
 from .routing import RoutingEngine, create_routing_engine
 from .backpressure import BackpressureMiddleware, create_backpressure_middleware
 from .consumer_group import ConsumerGroupManager, create_consumer_group_manager
+from .cluster_topology import ClusterTopology, create_cluster_topology
 
 
 # Global partition log instance
@@ -28,6 +29,9 @@ _backpressure: Optional[BackpressureMiddleware] = None
 
 # Global consumer group manager
 _consumer_group_manager: Optional[ConsumerGroupManager] = None
+
+# Global cluster topology
+_cluster_topology: Optional[ClusterTopology] = None
 
 
 def get_log() -> PartitionLog:
@@ -63,12 +67,21 @@ async def lifespan(app: FastAPI):
     global _consumer_group_manager
     _consumer_group_manager = create_consumer_group_manager()
 
+    global _cluster_topology
+    _cluster_topology = create_cluster_topology()
+    # Register this broker in the cluster
+    broker_id = os.getenv("STREAMCORE_BROKER_ID", "broker-0")
+    broker_host = os.getenv("STREAMCORE_BROKER_HOST", "localhost")
+    broker_port = int(os.getenv("STREAMCORE_PORT", "8000"))
+    _cluster_topology.add_broker(broker_id, broker_host, broker_port)
+
     yield
 
     _log.close()
     _log = None
     _backpressure = None
     _consumer_group_manager = None
+    _cluster_topology = None
 
 
 app = FastAPI(
@@ -645,6 +658,188 @@ async def get_all_consumer_group_lags(partition: str):
         high_watermark=log.high_watermark,
         group_offsets=lags
     )
+
+
+# ==================== Cluster Topology Models ====================
+
+class BrokerInfo(BaseModel):
+    """Broker information."""
+    broker_id: str
+    host: str
+    port: int
+    state: str
+    assigned_partitions: list[str]
+
+
+class PartitionInfo(BaseModel):
+    """Partition information."""
+    partition_id: str
+    topic: str
+    leader: Optional[str]
+    replicas: list[str]
+
+
+class TopicInfo(BaseModel):
+    """Topic information."""
+    topic: str
+    partition_count: int
+    replication_factor: int
+    partitions: list[PartitionInfo]
+
+
+class ClusterTopologyResponse(BaseModel):
+    """Cluster topology response."""
+    topics: list[TopicInfo]
+    brokers: list[BrokerInfo]
+
+
+class PartitionLeaderResponse(BaseModel):
+    """Partition leader response."""
+    topic: str
+    partition_id: str
+    leader_broker_id: Optional[str]
+    traversal: str
+
+
+class PartitionReassignRequest(BaseModel):
+    """Partition reassignment request."""
+    topic: str
+    partition_id: str
+    new_leader: str
+    new_replicas: Optional[list[str]] = None
+
+
+class CreateTopicRequest(BaseModel):
+    """Create topic request."""
+    topic_name: str
+    partition_count: int
+    replication_factor: int = 1
+
+
+# ==================== Cluster Topology Operations ====================
+
+def get_cluster_topology() -> ClusterTopology:
+    """Get the global cluster topology instance."""
+    if _cluster_topology is None:
+        raise RuntimeError("Cluster topology not initialized")
+    return _cluster_topology
+
+
+@app.post("/topics", response_model=TopicInfo)
+async def create_topic(request: CreateTopicRequest):
+    """Create a new topic with partition assignments."""
+    topology = get_cluster_topology()
+    topic_node = topology.create_topic(
+        request.topic_name,
+        request.partition_count,
+        request.replication_factor
+    )
+    return TopicInfo(
+        topic=topic_node.topic_name,
+        partition_count=topic_node.partition_count,
+        replication_factor=topic_node.replication_factor,
+        partitions=[
+            PartitionInfo(
+                partition_id=p.partition_id,
+                topic=p.topic,
+                leader=p.leader_broker_id,
+                replicas=p.replicas
+            )
+            for p in topic_node.children
+        ]
+    )
+
+
+@app.get("/topics", response_model=ClusterTopologyResponse)
+async def get_topology(traversal: str = "bfs"):
+    """Get full cluster topology (BFS or DFS)."""
+    topology = get_cluster_topology()
+
+    if traversal.lower() == "dfs":
+        topology_data = topology.get_topology_dfs()
+    else:
+        topology_data = topology.get_topology_bfs()
+
+    brokers = [
+        BrokerInfo(
+            broker_id=b.broker_id,
+            host=b.host,
+            port=b.port,
+            state=b.state.value,
+            assigned_partitions=b.assigned_partitions
+        )
+        for b in topology._brokers.values()
+    ]
+
+    topics = [
+        TopicInfo(
+            topic=t["topic"],
+            partition_count=t["partition_count"],
+            replication_factor=t["replication_factor"],
+            partitions=[
+                PartitionInfo(
+                    partition_id=p["partition_id"],
+                    topic=t["topic"],
+                    leader=p["leader"],
+                    replicas=p["replicas"]
+                )
+                for p in t["partitions"]
+            ]
+        )
+        for t in topology_data
+    ]
+
+    return ClusterTopologyResponse(topics=topics, brokers=brokers)
+
+
+@app.get("/topology/leader/{topic}/{partition_id}", response_model=PartitionLeaderResponse)
+async def get_partition_leader(topic: str, partition_id: str, traversal: str = "bfs"):
+    """Find partition leader using BFS or DFS traversal."""
+    topology = get_cluster_topology()
+
+    if traversal.lower() == "dfs":
+        leader = topology.find_partition_leader_dfs(topic, partition_id)
+    else:
+        leader = topology.find_partition_leader_bfs(topic, partition_id)
+
+    return PartitionLeaderResponse(
+        topic=topic,
+        partition_id=partition_id,
+        leader_broker_id=leader,
+        traversal=traversal.lower()
+    )
+
+
+@app.post("/topology/reassign", response_model=PartitionLeaderResponse)
+async def reassign_partition(request: PartitionReassignRequest):
+    """Reassign a partition to a new leader (simulates leadership election)."""
+    topology = get_cluster_topology()
+
+    success = topology.reassign_partition(
+        request.topic,
+        request.partition_id,
+        request.new_leader,
+        request.new_replicas
+    )
+
+    if not success:
+        raise HTTPException(status_code=400, detail="Reassignment failed")
+
+    leader = topology.find_partition_leader_bfs(request.topic, request.partition_id)
+
+    return PartitionLeaderResponse(
+        topic=request.topic,
+        partition_id=request.partition_id,
+        leader_broker_id=leader,
+        traversal="bfs"
+    )
+
+
+@app.get("/cluster/health")
+async def get_cluster_health():
+    """Get cluster health status."""
+    topology = get_cluster_topology()
+    return topology.get_cluster_health()
 
 
 # ==================== Health ====================
